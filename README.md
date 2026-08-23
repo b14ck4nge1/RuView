@@ -1,3 +1,277 @@
+<!-- WINDOWS-POWERSHELL-QUICKSTART -->
+# Windows PowerShell quick start — ESP32-S3 + RuView
+
+These commands restore RuView after another ESP32 app, provision Wi-Fi, run and verify the server, calibrate it, enable phone access, and optionally create a Cloudflare tunnel.
+
+> [!IMPORTANT]
+> Replace **COM9** if needed. CSI sensing requires **2.4 GHz Wi-Fi**. Never commit a real Wi-Fi password to this public repository.
+
+## 1. Set the path and find the ESP32
+
+```powershell
+$repo = "C:\Users\kianc\Desktop\New folder\AI Shop\ruview\3\RuView"
+Set-Location $repo
+py -m serial.tools.list_ports
+```
+
+If COM9 is busy, close Arduino/PlatformIO Serial Monitor, PuTTY, or miniterm. Press **Ctrl+]** to exit miniterm.
+
+## 2. Restore RuView after installing another ESP32 app
+
+```powershell
+Set-Location "$repo\firmware\esp32-csi-node"
+py -m esptool --chip esp32s3 --port COM9 flash_id
+py -m esptool --chip esp32s3 --port COM9 erase_flash
+
+$flashArgs = @(
+  "--chip", "esp32s3", "--port", "COM9", "--baud", "460800",
+  "write_flash", "--flash_mode", "dio", "--flash_freq", "80m",
+  "--flash_size", "8MB",
+  "0x0", ".\release_bins\bootloader_8mb.bin",
+  "0x8000", ".\release_bins\partition-table_8mb.bin",
+  "0xf000", ".\release_bins\ota_data_initial.bin",
+  "0x20000", ".\release_bins\esp32-csi-node_8mb.bin"
+)
+py -m esptool @flashArgs
+```
+
+For a 4 MB board, use `--flash_size 4MB` and the matching `*_4mb.bin` files. Do not mix image sizes.
+
+## 3. Provision HUST open 2.4 GHz Wi-Fi
+
+This writes RuView NVS settings; it does not reinstall the application firmware.
+
+```powershell
+Set-Location "$repo\firmware\esp32-csi-node"
+
+$targetIp = (Get-NetIPConfiguration -InterfaceAlias "Wi-Fi").IPv4Address.IPAddress |
+  Select-Object -First 1
+if ([string]::IsNullOrWhiteSpace($targetIp)) {
+  throw "No IPv4 address found on Wi-Fi."
+}
+Write-Host "HUST target IP: $targetIp"
+
+$provArgs = @(
+  "--port", "COM9", "--chip", "esp32s3",
+  "--ssid", "HUST_WIRELESS_2.4G", "--password=",
+  "--target-ip", "$targetIp", "--target-port", "5005",
+  "--node-id", "1", "--edge-tier", "2",
+  "--force-partial", "--reset",
+  "--state-dir", ".\state-hust-final"
+)
+py .\provision.py @provArgs
+```
+
+If it prints **NVS provisioning complete!** and then `FileExistsError` for `COM9.json`, the ESP32 flash succeeded; only the local state-file replacement failed. Use a new state directory or rename/delete that local JSON file.
+
+Password-protected Wi-Fi template:
+
+```powershell
+$wifiSsid = "YOUR_2.4_GHZ_WIFI"
+$wifiPassword = "YOUR_WIFI_PASSWORD"
+$targetIp = (Get-NetIPConfiguration -InterfaceAlias "Wi-Fi").IPv4Address.IPAddress |
+  Select-Object -First 1
+
+$provArgs = @(
+  "--port", "COM9", "--chip", "esp32s3",
+  "--ssid", "$wifiSsid", "--password", "$wifiPassword",
+  "--target-ip", "$targetIp", "--target-port", "5005",
+  "--node-id", "1", "--edge-tier", "2",
+  "--force-partial", "--reset",
+  "--state-dir", ".\state-private-wifi"
+)
+py .\provision.py @provArgs
+```
+
+## 4. Watch the ESP32 log
+
+```powershell
+py -m serial.tools.miniterm COM9 115200
+```
+
+Healthy logs show CSI callbacks, stable RSSI, and about 30+ packets per second. Exit with **Ctrl+]** before provisioning/flashing.
+
+## 5. Update and build the sensing server
+
+```powershell
+Set-Location $repo
+git pull
+git submodule update --init --recursive
+Set-Location "$repo\v2"
+cargo build -p wifi-densepose-sensing-server --release
+```
+
+Warnings are not fatal if Cargo ends with `Finished release profile`.
+
+## 6. Open only the ESP32 UDP firewall port
+
+Run PowerShell **as Administrator**:
+
+```powershell
+netsh advfirewall firewall add rule name="RuView ESP32 UDP 5005" dir=in action=allow protocol=UDP localport=5005 profile=any
+```
+
+## 7. Start RuView locally
+
+```powershell
+Get-Process "sensing-server" -ErrorAction SilentlyContinue | Stop-Process -Force
+Set-Location "$repo\v2"
+$env:RUST_LOG = "info"
+
+$serverArgs = @(
+  "--source", "esp32",
+  "--udp-port", "5005", "--http-port", "3000", "--ws-port", "3001",
+  "--bind-addr", "127.0.0.1",
+  "--udp-bind", "0.0.0.0", "--udp-insecure-lan"
+)
+& ".\target\release\sensing-server.exe" @serverArgs
+```
+
+Keep that window open and browse to <http://localhost:3000>.
+
+## 8. Verify data
+
+Use a second PowerShell window:
+
+```powershell
+curl.exe http://localhost:3000/health
+curl.exe http://localhost:3000/api/v1/nodes
+curl.exe http://localhost:3000/api/v1/sensing/latest
+curl.exe http://localhost:3000/api/v1/vital-signs
+```
+
+Expected: an increasing `tick`, node 1, sensing data instead of `no data yet`, and increasing vital-sign samples. If Windows receives packets but RuView has no node, re-provision using the PC's current Wi-Fi IPv4 and port 5005.
+
+Check who owns UDP 5005:
+
+```powershell
+$endpoint = Get-NetUDPEndpoint -LocalPort 5005 -ErrorAction SilentlyContinue |
+  Select-Object -First 1
+if ($endpoint) {
+  $endpoint
+  Get-Process -Id $endpoint.OwningProcess
+}
+```
+
+Close a temporary UDP test client before starting RuView:
+
+```powershell
+if ($udp) {
+  $udp.Close()
+  $udp.Dispose()
+  Remove-Variable udp -ErrorAction SilentlyContinue
+}
+```
+
+## 9. Calibration and Training
+
+1. Fix the ESP32 and router/access point in place.
+2. Leave the sensing area empty for 60 seconds.
+3. Sit or stand in the normal position for 60 seconds.
+4. Walk normally for 60 seconds.
+5. Wait for confidence to stabilize before trusting person count or vital signs.
+
+The **Training** section records room-specific labeled CSI. Record empty-room, one-person stationary, and one-person moving samples. Training improves classification, but one ESP32 cannot produce camera-like pose truth; low confidence can create ghost/split silhouettes.
+
+Optional recording API, when supported by the current build:
+
+```powershell
+$baseUrl = "http://localhost:3000"
+Invoke-RestMethod -Method Post -Uri "$baseUrl/api/v1/recording/start" -ContentType "application/json" -Body '{"id":"empty_room"}'
+Start-Sleep -Seconds 60
+Invoke-RestMethod -Method Post -Uri "$baseUrl/api/v1/recording/stop"
+Invoke-RestMethod -Uri "$baseUrl/api/v1/recordings"
+Invoke-RestMethod -Uri "$baseUrl/api/v1/adaptive/status"
+```
+
+If an endpoint returns 404, use the web UI Training controls because API names can change.
+
+## 10. Optional phone access on the same LAN
+
+Campus Wi-Fi may isolate clients. If direct LAN access fails, use Cloudflare below.
+
+Run PowerShell **as Administrator**:
+
+```powershell
+netsh advfirewall firewall add rule name="RuView Web TCP 3000" dir=in action=allow protocol=TCP localport=3000 profile=any
+```
+
+Restart RuView with `--bind-addr 0.0.0.0`:
+
+```powershell
+Set-Location "$repo\v2"
+$serverArgs = @(
+  "--source", "esp32",
+  "--udp-port", "5005", "--http-port", "3000", "--ws-port", "3001",
+  "--bind-addr", "0.0.0.0",
+  "--udp-bind", "0.0.0.0", "--udp-insecure-lan"
+)
+& ".\target\release\sensing-server.exe" @serverArgs
+```
+
+Show the phone URL:
+
+```powershell
+$targetIp = (Get-NetIPConfiguration -InterfaceAlias "Wi-Fi").IPv4Address.IPAddress |
+  Select-Object -First 1
+Write-Host ("Open on phone: http://{0}:3000" -f $targetIp)
+```
+
+Close the web port afterward:
+
+```powershell
+netsh advfirewall firewall delete rule name="RuView Web TCP 3000"
+```
+
+## 11. Optional Cloudflare Quick Tunnel without winget
+
+This gives a temporary public HTTPS URL without opening TCP 3000. Anyone with the URL can access the dashboard while it runs.
+
+```powershell
+$cloudflaredDir = "$env:LOCALAPPDATA\cloudflared"
+$cloudflaredExe = "$cloudflaredDir\cloudflared.exe"
+New-Item -ItemType Directory -Force -Path $cloudflaredDir | Out-Null
+curl.exe -L "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -o $cloudflaredExe
+& $cloudflaredExe --version
+```
+
+Start RuView locally with host validation disabled:
+
+```powershell
+Set-Location "$repo\v2"
+$serverArgs = @(
+  "--source", "esp32",
+  "--udp-port", "5005", "--http-port", "3000", "--ws-port", "3001",
+  "--bind-addr", "127.0.0.1",
+  "--udp-bind", "0.0.0.0", "--udp-insecure-lan",
+  "--disable-host-validation"
+)
+& ".\target\release\sensing-server.exe" @serverArgs
+```
+
+In another PowerShell window:
+
+```powershell
+$cloudflaredExe = "$env:LOCALAPPDATA\cloudflared\cloudflared.exe"
+& $cloudflaredExe tunnel --protocol quic --url http://127.0.0.1:3000
+```
+
+Open the printed `https://...trycloudflare.com` URL on the phone. Press **Ctrl+C** to stop it. The URL changes each run.
+
+## 12. Remove firewall rules
+
+Run PowerShell **as Administrator**:
+
+```powershell
+netsh advfirewall firewall delete rule name="RuView Web TCP 3000"
+netsh advfirewall firewall delete rule name="RuView ESP32 UDP 5005"
+```
+
+Remove only the web rule if the ESP32 still needs to send UDP packets to RuView.
+
+
+---
+
 # π RuView
 
 <p align="center">
